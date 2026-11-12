@@ -338,6 +338,34 @@ class ProgressDialog {
     final int id = ++_showId;
     _dialog = _DialogBody(key: _dialogBodyKey);
 
+    // Defer to after the current frame so show() is safe to call from
+    // initState() or build(), where showDialog would otherwise fail.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _present(id));
+    WidgetsBinding.instance.ensureVisualUpdate();
+
+    if (_showLogs) debugPrint('ProgressDialog shown');
+    return true;
+  }
+
+  /// Actually pushes the dialog route. Runs after the current frame.
+  void _present(int id) {
+    // A newer show() superseded this one.
+    if (id != _showId) return;
+
+    // hide() was called before the route was ever pushed: just cancel.
+    if (_hideRequested) {
+      _hideRequested = false;
+      _isShowing = false;
+      return;
+    }
+
+    final ctx = _context;
+    if (ctx == null || !ctx.mounted) {
+      _isShowing = false;
+      debugPrint('ProgressDialog: context is no longer mounted');
+      return;
+    }
+
     showDialog<void>(
       context: ctx,
       barrierDismissible: _barrierDismissible,
@@ -373,9 +401,6 @@ class ProgressDialog {
       _hideRequested = false;
       if (_showLogs) debugPrint('ProgressDialog closed');
     });
-
-    if (_showLogs) debugPrint('ProgressDialog shown');
-    return true;
   }
 }
 
