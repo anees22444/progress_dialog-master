@@ -7,8 +7,6 @@
 /// The dialog is highly customizable and supports dynamic updates while being shown.
 library;
 
-import 'dart:async';
-
 import 'package:material_ui/material_ui.dart';
 
 /// Defines the type of progress dialog to be displayed.
@@ -44,17 +42,25 @@ TextDirection _direction = TextDirection.ltr;
 
 // ===== Dialog State Variables =====
 
-/// Whether the dialog is currently being shown
+/// Whether the dialog is currently being shown (set synchronously by show()).
 bool _isShowing = false;
 
+/// Set when hide() is called before the dialog route has been built.
+bool _hideRequested = false;
+
+/// Incremented on every show(), so a late-completing old dialog future
+/// can never reset the state of a newer dialog.
+int _showId = 0;
+
 /// Build contexts for showing and dismissing the dialog
-late BuildContext _context, _dismissingContext;
+BuildContext? _context, _dismissingContext;
 
 /// The type of progress dialog (normal or download)
 ProgressDialogType? _progressDialogType;
 
-/// Whether the dialog can be dismissed by tapping outside or pressing back button
-bool _barrierDismissible = true;
+/// Whether the dialog can be dismissed by tapping outside or pressing back button.
+/// Defaults to false: a loading dialog should not close on a stray tap.
+bool _barrierDismissible = false;
 
 /// Whether to show debug logs
 bool _showLogs = false;
@@ -98,7 +104,7 @@ Widget _progressWidget = Image.asset(
 
 /// Global key for accessing the dialog body state
 final GlobalKey<_DialogBodyState> _dialogBodyKey =
-    GlobalKey<_DialogBodyState>();
+GlobalKey<_DialogBodyState>();
 
 /// The main class for creating and managing progress dialogs.
 ///
@@ -124,21 +130,21 @@ class ProgressDialog {
   ///
   /// Optional parameters:
   /// - [type]: The type of dialog (normal or download). Defaults to normal.
-  /// - [isDismissible]: Whether the dialog can be dismissed by tapping outside or back button. Defaults to true.
+  /// - [isDismissible]: Whether the dialog can be dismissed by tapping outside or back button. Defaults to false.
   /// - [showLogs]: Whether to print debug logs. Defaults to false.
   /// - [textDirection]: Text direction for RTL/LTR support. Defaults to LTR.
   /// - [customBody]: Custom widget to replace the entire dialog body. Defaults to null.
   ProgressDialog(
-    BuildContext context, {
-    ProgressDialogType? type,
-    bool? isDismissible,
-    bool? showLogs,
-    TextDirection? textDirection,
-    Widget? customBody,
-  }) {
+      BuildContext context, {
+        ProgressDialogType? type,
+        bool? isDismissible,
+        bool? showLogs,
+        TextDirection? textDirection,
+        Widget? customBody,
+      }) {
     _context = context;
     _progressDialogType = type ?? ProgressDialogType.normal;
-    _barrierDismissible = isDismissible ?? true;
+    _barrierDismissible = isDismissible ?? false;
     _showLogs = showLogs ?? false;
     _direction = textDirection ?? TextDirection.ltr;
     _customBody = customBody;
@@ -263,49 +269,40 @@ class ProgressDialog {
 
   /// Hides the progress dialog if it's currently visible.
   ///
-  /// This method dismisses the dialog and updates the internal state.
-  /// It uses [Navigator.pop] to remove the dialog from the widget tree.
-  ///
   /// Returns a [Future<bool>] that completes with:
-  /// - `false` if the dialog was successfully hidden
-  /// - `false` if there was an error (dialog state will be reset)
+  /// - `true` if a hide was performed (or scheduled, when the dialog route
+  ///   has not been built yet)
+  /// - `false` if the dialog was not showing
   ///
-  /// Throws [ProgressDialogException] if the dialog is already dismissed,
-  /// but catches it internally and returns `false`.
-  ///
-  /// **Note:** Always await this method before navigating to other screens
-  /// to ensure proper cleanup.
+  /// It is safe to call this immediately after [show], even if the work
+  /// between them finished instantly: the hide is queued and executed as soon
+  /// as the dialog route exists.
   Future<bool> hide() async {
-    try {
-      // Check if dialog is already dismissed
-      if (!_isShowing) {
-        throw ProgressDialogException(
-          ProgressDialogExceptionType.alreadyDismissed,
-        );
-      }
+    if (!_isShowing) {
+      if (_showLogs) debugPrint('ProgressDialog already dismissed');
+      return false;
+    }
 
-      // Schedule dialog dismissal on the next microtask to avoid
-      // potential issues with the current build cycle
-      scheduleMicrotask(() {
-        Navigator.of(_dismissingContext, rootNavigator: true).pop();
-        _isShowing = false;
-      });
+    // show() was called but the route hasn't been built yet:
+    // remember the request and close as soon as it exists.
+    if (_dismissingContext == null) {
+      _hideRequested = true;
+      return true;
+    }
 
-      // Log dismissal if logging is enabled
-      if (_showLogs) debugPrint('ProgressDialog dismissed');
+    _closeDialog();
+    if (_showLogs) debugPrint('ProgressDialog dismissed');
+    return true;
+  }
 
-      return await Future.value(_isShowing);
-    } on ProgressDialogException catch (err) {
-      // Handle known dialog exceptions
-      debugPrint(err.type.message);
-      debugPrint(err.toString());
-      return Future.value(false);
-    } catch (err) {
-      // Handle any other unexpected errors
-      _isShowing = false;
-      debugPrint('Seems there is an issue hiding dialog');
-      debugPrint(err.toString());
-      return Future.value(false);
+  /// Pops the dialog route and resets the internal state.
+  void _closeDialog() {
+    final ctx = _dismissingContext;
+    _dismissingContext = null;
+    _hideRequested = false;
+    _isShowing = false;
+    if (ctx != null && ctx.mounted) {
+      Navigator.of(ctx, rootNavigator: true).pop();
     }
   }
 
@@ -317,72 +314,68 @@ class ProgressDialog {
   ///
   /// Returns a [Future<bool>] that completes with:
   /// - `true` if the dialog was successfully shown
-  /// - `false` if there was an error or the dialog was already visible
+  /// - `false` if the dialog was already visible or the context is unmounted
   ///
-  /// Throws [ProgressDialogException] if the dialog is already shown,
-  /// but catches it internally and returns `false`.
-  ///
-  /// The dialog creation process:
-  /// 1. Checks if dialog is already visible
-  /// 2. Creates a new [_DialogBody] instance
-  /// 3. Uses [scheduleMicrotask] to show dialog on next event loop iteration
-  /// 4. Configures dialog properties (dismissible behavior, styling, etc.)
-  /// 5. Updates internal state to track dialog visibility
+  /// Call this from an event handler or after an `await`, not directly
+  /// inside `build()`.
   Future<bool> show() async {
-    try {
-      // Prevent showing multiple dialogs simultaneously
-      if (_isShowing) {
-        throw ProgressDialogException(ProgressDialogExceptionType.alreadyShown);
-      }
-
-      // Create the dialog body widget
-      _dialog = _DialogBody(key: _dialogBodyKey);
-
-      // Schedule dialog display on the next microtask to avoid
-      // potential issues with the current build cycle
-      scheduleMicrotask(() {
-        showDialog<dynamic>(
-          context: _context,
-          barrierDismissible: _barrierDismissible,
-          builder: (BuildContext buildContext) {
-            // Store context for dismissing the dialog later
-            _dismissingContext = buildContext;
-            return PopScope(
-              canPop: _barrierDismissible,
-              child: Dialog(
-                backgroundColor: _backgroundColor,
-                insetAnimationCurve: _insetAnimCurve,
-                insetAnimationDuration: const Duration(milliseconds: 100),
-                elevation: _dialogElevation,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.all(
-                    Radius.circular(_borderRadius),
-                  ),
-                ),
-                child: Builder(builder: (_) => _dialog!),
-              ),
-            );
-          },
-        );
-        _isShowing = true;
-      });
-
-      // Log dialog display if logging is enabled
-      if (_showLogs) debugPrint('ProgressDialog shown');
-
-      return await Future.value(_isShowing);
-    } on ProgressDialogException catch (err) {
-      // Handle known dialog exceptions
-      debugPrint(err.type.message);
-      debugPrint(err.toString());
-      return Future.value(false);
-    } catch (err) {
-      // Handle any other unexpected errors
-      _isShowing = false;
-      debugPrint('Exception while showing the dialog');
-      debugPrint(err.toString());
-      return Future.value(false);
+    // Prevent showing multiple dialogs simultaneously
+    if (_isShowing) {
+      if (_showLogs) debugPrint('ProgressDialog already shown');
+      return false;
     }
+
+    final ctx = _context;
+    if (ctx == null || !ctx.mounted) {
+      debugPrint('ProgressDialog: context is no longer mounted');
+      return false;
+    }
+
+    // Set synchronously so show()/hide() calls right after each other are safe.
+    _isShowing = true;
+    _hideRequested = false;
+    _dismissingContext = null;
+    final int id = ++_showId;
+    _dialog = _DialogBody(key: _dialogBodyKey);
+
+    showDialog<void>(
+      context: ctx,
+      barrierDismissible: _barrierDismissible,
+      builder: (BuildContext buildContext) {
+        // Store context for dismissing the dialog later
+        _dismissingContext = buildContext;
+
+        // hide() was called before we were built.
+        if (_hideRequested) {
+          WidgetsBinding.instance.addPostFrameCallback((_) => _closeDialog());
+        }
+
+        return PopScope(
+          canPop: _barrierDismissible,
+          child: Dialog(
+            backgroundColor: _backgroundColor,
+            insetAnimationCurve: _insetAnimCurve,
+            insetAnimationDuration: const Duration(milliseconds: 100),
+            elevation: _dialogElevation,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.all(Radius.circular(_borderRadius)),
+            ),
+            child: Builder(builder: (_) => _dialog!),
+          ),
+        );
+      },
+    ).then((_) {
+      // Runs when the route is gone for ANY reason (hide, barrier tap, back).
+      // Ignore if a newer dialog has been shown in the meantime.
+      if (id != _showId) return;
+      _isShowing = false;
+      _dismissingContext = null;
+      _hideRequested = false;
+      if (_showLogs) debugPrint('ProgressDialog closed');
+    });
+
+    if (_showLogs) debugPrint('ProgressDialog shown');
+    return true;
   }
 }
 
@@ -404,16 +397,8 @@ class _DialogBodyState extends State<_DialogBody> {
   /// Triggers a rebuild of the dialog UI.
   /// This method is called internally to refresh the dialog appearance
   /// when content is updated via the update() method.
-  update() {
-    setState(() {});
-  }
-
-  @override
-  void dispose() {
-    // Reset the showing state when dialog is disposed
-    _isShowing = false;
-    if (_showLogs) debugPrint('ProgressDialog dismissed by back button');
-    super.dispose();
+  void update() {
+    if (mounted) setState(() {});
   }
 
   @override
